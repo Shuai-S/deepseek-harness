@@ -8,6 +8,10 @@ name: Fork · Desktop · unsigned installers
 #
 # The schedule builds only the platforms whose installer for the current upstream version is not
 # published yet, so an upstream version bump produces a new release without operator input.
+#
+# GitHub marks this fork-only workflow `disabled_manually` whenever the file changes on the default
+# branch. After editing it, re-enable it with `gh workflow enable 428785243 -R Shuai-S/deepseek-harness`,
+# otherwise the schedule stops without any notification.
 
 on:
   workflow_dispatch:
