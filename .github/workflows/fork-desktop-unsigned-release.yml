@@ -365,11 +365,26 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Generate checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
         run: |
           set -euo pipefail
           cd dist
-          sha256sum -- * > ../SHA256SUMS.txt
-          cat ../SHA256SUMS.txt
+          sha256sum -- * > ../current.sha256
+          cd ..
+          # A run may publish only the platforms it rebuilt, so keep the checksum lines of the
+          # assets already in the release and replace only the ones this run uploads.
+          : > previous.sha256
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --pattern SHA256SUMS.txt --output previous.sha256 --clobber || : > previous.sha256
+          fi
+          awk 'NR == FNR { uploaded[$2] = 1; next } !($2 in uploaded)' \
+            current.sha256 previous.sha256 > kept.sha256
+          sort -k2 current.sha256 kept.sha256 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - name: Publish to Releases
         env:
           GH_TOKEN: ${{ github.token }}
@@ -386,16 +401,9 @@ jobs:
           Unofficial unsigned installers for $SOURCE_REPOSITORY at \`$COMMIT\`, packaged from \`$SOURCE_REF\` with the documented \`package:desktop:*:unsigned\` commands.
 
           - Product version: \`$VERSION\`
-          - Checksums: \`SHA256SUMS.txt\`
+          - Targets: macOS Intel (x86_64), macOS Apple Silicon (arm64) and Windows x64; each asset name states its platform
+          - Checksums: \`SHA256SUMS.txt\` covers every installer in this release
           - Workflow run: [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
-
-          $(cd dist && for file in *; do
-            case "$file" in
-              *-mac-x64-*) echo "- macOS Intel (x86_64): \`$file\`" ;;
-              *-mac-arm64-*) echo "- macOS Apple Silicon (arm64): \`$file\`" ;;
-              *-win-x64-*) echo "- Windows x64: \`$file\`" ;;
-            esac
-          done)
 
           The installers are unsigned and unnotarized. On macOS, open System Settings → Privacy & Security and choose Open Anyway for the first launch. On Windows, SmartScreen warns before running the installer. Automatic updates are not configured, and Windows mandatory-update policy reports itself unavailable, so a newer version needs a newer release from this repository.
           EOF
@@ -403,6 +411,7 @@ jobs:
           case "$VERSION" in *-*) prerelease=(--prerelease) ;; *) prerelease=() ;; esac
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/* SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --notes "$notes"
           else
             gh release create "$RELEASE_TAG" dist/* SHA256SUMS.txt \
               --repo "$GITHUB_REPOSITORY" \
@@ -410,4 +419,5 @@ jobs:
               --notes "$notes" \
               "${prerelease[@]}"
           fi
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name'
           echo "Published: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
