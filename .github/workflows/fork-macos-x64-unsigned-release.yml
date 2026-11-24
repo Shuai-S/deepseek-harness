@@ -44,8 +44,6 @@ jobs:
     timeout-minutes: 300
     env:
       DSH_TELEMETRY_DISABLED: '1'
-      # Outside the checkout, so the reported free space stays comparable between runs.
-      DSH_DESKTOP_PACKAGE_CACHE_DIR: ${{ runner.temp }}/dsh-desktop-package-cache
     steps:
       - name: Report build host
         run: |
@@ -167,7 +165,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DMG: ${{ steps.artifacts.outputs.dmg }}
-          DMG_NAME: ${{ steps.artifacts.outputs.name }}
           PRODUCT_VERSION: ${{ steps.artifacts.outputs.version }}
           REQUESTED_TAG: ${{ inputs.release_tag }}
           SOURCE_REF: ${{ inputs.source_ref }}
