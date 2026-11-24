@@ -1,0 +1,376 @@
+name: Fork · Desktop · unsigned installers
+
+# Fork-only workflow (not part of upstream). Builds the documented local unsigned installers for
+# macOS Intel, macOS Apple Silicon and Windows x64 on GitHub-hosted runners and publishes them to
+# this repository's Releases. Upstream's package workflows cannot run here: they need self-hosted
+# machine presets, release signing credentials, notarization, and an archival route bound to the
+# original runner.
+#
+# The schedule builds only the platforms whose installer for the current upstream version is not
+# published yet, so an upstream version bump produces a new release without operator input.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: '打包源码仓库（owner/repo）'
+        type: string
+        default: deepseek-ai/deepseek-harness
+        required: true
+      source_ref:
+        description: '打包源码 ref：分支或 tag'
+        type: string
+        default: master
+        required: true
+      platforms:
+        description: '目标平台，逗号分隔：mac-x64 / mac-arm64 / win-x64'
+        type: string
+        default: mac-x64,mac-arm64,win-x64
+        required: true
+      check_only:
+        description: '仅预检工具链与打包配置，不构建'
+        type: boolean
+        default: false
+      publish_release:
+        description: '成功后发布到本仓库 Releases'
+        type: boolean
+        default: true
+  schedule:
+    # 22:00 UTC = 06:00 Asia/Shanghai. The plan job skips already published platforms.
+    - cron: '0 22 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-desktop-unsigned
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+      repository: ${{ steps.resolve.outputs.repository }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      version: ${{ steps.resolve.outputs.version }}
+      commit: ${{ steps.resolve.outputs.commit }}
+      release_tag: ${{ steps.resolve.outputs.release_tag }}
+      check_only: ${{ steps.resolve.outputs.check_only }}
+      publish_release: ${{ steps.resolve.outputs.publish_release }}
+      building: ${{ steps.resolve.outputs.building }}
+    steps:
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '^24.22.3'
+      - name: Resolve the upstream version and the platforms still missing
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_REPOSITORY: ${{ inputs.source_repository || 'deepseek-ai/deepseek-harness' }}
+          SOURCE_REF: ${{ inputs.source_ref || 'master' }}
+          PLATFORMS: ${{ inputs.platforms || 'mac-x64,mac-arm64,win-x64' }}
+          CHECK_ONLY: ${{ inputs.check_only }}
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'JS'
+          import { execFileSync } from 'node:child_process'
+          import { appendFileSync } from 'node:fs'
+
+          const environment = process.env
+          const repository = environment.SOURCE_REPOSITORY || 'deepseek-ai/deepseek-harness'
+          const ref = environment.SOURCE_REF || 'master'
+          const requested = (environment.PLATFORMS || 'mac-x64,mac-arm64,win-x64')
+            .split(',').map(value => value.trim()).filter(Boolean)
+
+          const targets = {
+            'mac-x64': { runner: 'macos-15-intel', script: 'package:desktop:mac:x64:unsigned', directory: 'mac-x64', extension: 'dmg', arch: 'x86_64', shell: 'bash' },
+            'mac-arm64': { runner: 'macos-15', script: 'package:desktop:mac:arm64:unsigned', directory: 'mac-arm64', extension: 'dmg', arch: 'arm64', shell: 'bash' },
+            'win-x64': { runner: 'windows-2025', script: 'package:desktop:win:x64:unsigned', directory: 'win-x64', extension: 'exe', arch: 'x86_64', shell: 'pwsh' },
+          }
+          const unknown = requested.filter(platform => targets[platform] === undefined)
+          if (unknown.length > 0) {
+            throw new Error(`unknown platforms: ${unknown.join(', ')}; expected one of ${Object.keys(targets).join(', ')}`)
+          }
+
+          const gh = (...args) => execFileSync('gh', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+          const commit = gh('api', `repos/${repository}/commits/${ref}`, '--jq', '.sha')
+          const encoded = gh('api', `repos/${repository}/contents/package.json?ref=${commit}`, '--jq', '.content')
+          const version = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8')).version
+          const releaseTag = `desktop-v${version}`
+
+          let published = []
+          try {
+            published = JSON.parse(gh('release', 'view', releaseTag, '--repo', environment.GITHUB_REPOSITORY, '--json', 'assets'))
+              .assets.map(asset => asset.name)
+          } catch {
+            // No release for this version yet: every requested platform builds.
+          }
+
+          const missing = requested.filter(platform => !published.some(name => name.includes(`-${platform}-unsigned.`)))
+          const selected = environment.EVENT_NAME === 'schedule' && environment.CHECK_ONLY !== 'true' ? missing : requested
+          const matrix = selected.length === 0
+            ? ''
+            : JSON.stringify({ include: selected.map(platform => ({ platform, ...targets[platform] })) })
+
+          const output = {
+            repository,
+            ref,
+            version,
+            commit,
+            release_tag: releaseTag,
+            check_only: environment.CHECK_ONLY === 'true' ? 'true' : 'false',
+            publish_release: environment.PUBLISH_RELEASE === 'false' ? 'false' : 'true',
+            matrix,
+            building: selected.join(' '),
+          }
+          appendFileSync(environment.GITHUB_OUTPUT,
+            `${Object.entries(output).map(([key, value]) => `${key}=${value}`).join('\n')}\n`)
+          console.log(`${repository}@${ref} -> ${commit}, version ${version}`)
+          console.log(`published: [${published.join(', ')}]`)
+          console.log(`building: [${selected.join(', ')}]`)
+          JS
+      - name: Summarize the plan
+        run: |
+          {
+            echo '### Unsigned desktop installers'
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Source | \`${{ steps.resolve.outputs.repository }}\` @ \`${{ steps.resolve.outputs.commit }}\` |"
+            echo "| Version | \`${{ steps.resolve.outputs.version }}\` |"
+            echo "| Release tag | \`${{ steps.resolve.outputs.release_tag }}\` |"
+            echo "| Building | \`${{ steps.resolve.outputs.building }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  package:
+    name: Package ${{ matrix.platform }}
+    needs: plan
+    if: needs.plan.outputs.matrix != ''
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+    steps:
+      - name: Report build host
+        if: matrix.shell == 'bash'
+        shell: bash
+        run: |
+          set -euo pipefail
+          uname -a
+          sw_vers
+          echo "cpu=$(sysctl -n machdep.cpu.brand_string)"
+          echo "ncpu=$(sysctl -n hw.ncpu) mem_gb=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))"
+          xcodebuild -version
+          df -h /
+      - name: Report build host
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          "pwsh $($PSVersionTable.PSVersion)"
+          (Get-CimInstance Win32_Processor).Name
+          Get-PSDrive C | Format-List Used,Free
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ needs.plan.outputs.repository }}
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+          clean: true
+      # pnpm v11 ships no darwin-x64 standalone binary, and the pnpm/action-setup v6 self-update
+      # path needs one; the Intel leg stays on the v5 npm-install line.
+      - uses: pnpm/action-setup@v5.0.0
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '^24.22.3'
+          cache: pnpm
+      - name: Install locked dependencies
+        shell: ${{ matrix.shell }}
+        run: pnpm install --frozen-lockfile
+      # Windows packaging resolves mandatory-update policy metadata even for unsigned builds, so the
+      # selected deployment needs an HTTPS origin. The reserved `.invalid` domain never resolves, so
+      # the packaged application reports the policy as unavailable instead of contacting a real
+      # service; automatic updates stay unconfigured, as for every unsigned build.
+      - name: Write the Windows packaging settings
+        if: matrix.platform == 'win-x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $settings = @(
+            'DSH_DESKTOP_APP_ID=com.deepseek.harness'
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=production'
+            'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://policy.invalid'
+          )
+          Set-Content -Path 'apps/desktop/.env.windows' -Value $settings -Encoding utf8NoBOM
+          Get-Content 'apps/desktop/.env.windows'
+      - name: Check packaging configuration and toolchain
+        if: needs.plan.outputs.check_only == 'true'
+        shell: ${{ matrix.shell }}
+        run: pnpm run ${{ matrix.script }} --check
+      - name: Build the unsigned installer
+        if: needs.plan.outputs.check_only != 'true'
+        shell: ${{ matrix.shell }}
+        run: pnpm run ${{ matrix.script }}
+      - name: Verify the macOS installer
+        if: matrix.shell == 'bash' && needs.plan.outputs.check_only != 'true'
+        id: mac
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          directory="apps/desktop/.desktop-build/targets/${{ matrix.directory }}/unsigned-artifacts"
+          installers=("$directory"/*.${{ matrix.extension }})
+          if [ "${#installers[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one installer in $directory, found ${#installers[@]}"
+            ls -la "$directory" 2>/dev/null || echo '(directory absent)'
+            exit 1
+          fi
+          installer="${installers[0]}"
+          echo "file=$installer" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$installer")" >> "$GITHUB_OUTPUT"
+          ls -lh "$installer"
+          hdiutil imageinfo "$installer" | grep -E 'Format|Checksum Type' || true
+
+          mount="$(mktemp -d "$RUNNER_TEMP/dmg.XXXXXX")"
+          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$mount" "$installer" >/dev/null
+          trap 'hdiutil detach "$mount" -quiet || true; rm -rf "$mount"' EXIT
+
+          app="$(find "$mount" -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$app" ]; then echo "::error::DMG contains no .app bundle"; exit 1; fi
+          executable="$(find "$app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
+          if [ -z "$executable" ]; then echo "::error::application bundle has no executable"; exit 1; fi
+          archs="$(lipo -archs "$executable")"
+          echo "main executable archs: $archs"
+          echo "CFBundleShortVersionString: $(defaults read "$app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo unknown)"
+          echo "CFBundleIdentifier: $(defaults read "$app/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || echo unknown)"
+          if [ "$archs" != '${{ matrix.arch }}' ]; then
+            echo "::error::expected a thin ${{ matrix.arch }} application, got: $archs"
+            exit 1
+          fi
+      - name: Verify the Windows installer
+        if: matrix.shell == 'pwsh' && needs.plan.outputs.check_only != 'true'
+        id: windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $directory = "apps/desktop/.desktop-build/targets/${{ matrix.directory }}/unsigned-artifacts"
+          $installers = @(Get-ChildItem -Path $directory -Filter "*.${{ matrix.extension }}")
+          if ($installers.Count -ne 1) {
+            throw "expected exactly one installer in $directory, found $($installers.Count)"
+          }
+          $installer = $installers[0]
+          "file=$($installer.FullName)" >> $env:GITHUB_OUTPUT
+          "name=$($installer.Name)" >> $env:GITHUB_OUTPUT
+          $signature = Get-AuthenticodeSignature -FilePath $installer.FullName
+          $version = (Get-Item $installer.FullName).VersionInfo
+          "installer: $($installer.Name) bytes=$($installer.Length) signature=$($signature.Status) product=$($version.ProductVersion)"
+          if ($signature.Status -ne 'NotSigned') {
+            throw "expected an unsigned installer, got $($signature.Status)"
+          }
+      - name: Summarize the macOS installer
+        if: matrix.shell == 'bash' && needs.plan.outputs.check_only != 'true'
+        run: |
+          {
+            echo "### \`${{ matrix.platform }}\`"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Installer | \`${{ steps.mac.outputs.name }}\` |"
+            echo "| Size | $(du -h "${{ steps.mac.outputs.file }}" | cut -f1) |"
+            echo "| Source commit | \`${{ needs.plan.outputs.commit }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Summarize the Windows installer
+        if: matrix.shell == 'pwsh' && needs.plan.outputs.check_only != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $size = '{0:N1} MiB' -f ((Get-Item '${{ steps.windows.outputs.file }}').Length / 1MB)
+          @(
+            "### ``${{ matrix.platform }}``"
+            ''
+            '| Field | Value |'
+            '| --- | --- |'
+            "| Installer | ``${{ steps.windows.outputs.name }}`` |"
+            "| Size | $size |"
+            "| Source commit | ``${{ needs.plan.outputs.commit }}`` |"
+          ) + @('') | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+      - uses: actions/upload-artifact@v7.0.1
+        if: needs.plan.outputs.check_only != 'true'
+        with:
+          name: ${{ steps.mac.outputs.name }}${{ steps.windows.outputs.name }}
+          path: ${{ steps.mac.outputs.file }}${{ steps.windows.outputs.file }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    needs: [plan, package]
+    if: needs.package.result == 'success' && needs.plan.outputs.publish_release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- * > ../SHA256SUMS.txt
+          cat ../SHA256SUMS.txt
+      - name: Publish to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          COMMIT: ${{ needs.plan.outputs.commit }}
+          SOURCE_REPOSITORY: ${{ needs.plan.outputs.repository }}
+          SOURCE_REF: ${{ needs.plan.outputs.ref }}
+        run: |
+          set -euo pipefail
+          notes="$(cat <<EOF
+          Unofficial local unsigned installers for $SOURCE_REPOSITORY at \`$COMMIT\`, packaged from \`$SOURCE_REF\` with the documented \`package:desktop:*:unsigned\` commands.
+
+          - Product version: \`$VERSION\`
+          - Checksums: \`SHA256SUMS.txt\`
+          - Workflow run: [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
+
+          | Platform | Installer |
+          | --- | --- |
+          $(cd dist && for file in *; do
+            case "$file" in
+              *-mac-x64-*) echo "| macOS Intel (x86_64) | \`$file\` |" ;;
+              *-mac-arm64-*) echo "| macOS Apple Silicon (arm64) | \`$file\` |" ;;
+              *-win-x64-*) echo "| Windows x64 | \`$file\` |" ;;
+            esac
+          done)
+
+          The installers are unsigned and unnotarized. On macOS, open **System Settings → Privacy & Security** and choose **Open Anyway** for the first launch. On Windows, SmartScreen warns before running the installer. Automatic updates are not configured, and Windows mandatory-update policy reports itself unavailable, so a newer version needs a newer release from this repository.
+          EOF
+          )"
+          case "$VERSION" in *-*) prerelease=(--prerelease) ;; *) prerelease=() ;; esac
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            shopt -s nullglob
+            gh release upload "$RELEASE_TAG" dist/* SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            shopt -s nullglob
+            gh release create "$RELEASE_TAG" dist/* SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Desktop $VERSION · unsigned installers" \
+              --notes "$notes" \
+              "${prerelease[@]}"
+          fi
+          echo "Published: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
