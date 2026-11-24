@@ -37,7 +37,7 @@ jobs:
           set -euo pipefail
           builder=".github/workflows/fork-desktop-unsigned-release.yml"
           id="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows" \
-            --jq --arg path "$builder" '.workflows[] | select(.path == $path) | .id')"
+            --jq ".workflows[] | select(.path == \"$builder\") | .id")"
           if [ -z "$id" ]; then
             echo "::error::$builder is not registered on this repository"
             exit 1
