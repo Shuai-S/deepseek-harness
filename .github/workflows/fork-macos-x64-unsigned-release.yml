@@ -1,0 +1,198 @@
+name: Fork · Desktop · macOS Intel (x64) unsigned DMG
+
+# Fork-only workflow (not part of upstream). Builds the unsupported-but-documented local macOS x64
+# installer on a native Intel GitHub-hosted runner and publishes the DMG to this repository's Releases.
+# Upstream's macos-intel-package.yml cannot be reused: it requires self-hosted machine presets,
+# release signing credentials, notarization, and an archival route bound to the original runner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: '打包源码：本仓库分支名（不支持 SHA / tag / PR ref）'
+        type: string
+        default: master
+        required: true
+      check_only:
+        description: '仅预检工具链与打包配置，不构建（约 10–15 分钟）'
+        type: boolean
+        default: false
+      publish_release:
+        description: '构建成功后发布 DMG 到本仓库 Releases'
+        type: boolean
+        default: true
+      release_tag:
+        description: 'Release tag：留空自动生成 desktop-x64-<版本>-r<运行号>'
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-macos-x64-unsigned
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  package:
+    name: Build unsigned Intel DMG
+    runs-on: macos-15-intel
+    timeout-minutes: 300
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+      # Outside the checkout, so the reported free space stays comparable between runs.
+      DSH_DESKTOP_PACKAGE_CACHE_DIR: ${{ runner.temp }}/dsh-desktop-package-cache
+    steps:
+      - name: Report build host
+        run: |
+          set -euo pipefail
+          uname -a
+          sw_vers
+          echo "cpu=$(sysctl -n machdep.cpu.brand_string)"
+          echo "ncpu=$(sysctl -n hw.ncpu) mem_gb=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))"
+          xcode-select -p
+          xcodebuild -version
+          df -h /
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          clean: true
+          ref: ${{ inputs.source_ref }}
+      - name: Validate selected source
+        env:
+          PACKAGE_SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          branch="$(git rev-parse --abbrev-ref HEAD)"
+          if [ "$branch" != "$PACKAGE_SOURCE_REF" ]; then
+            echo "::error::source_ref must be a branch in this repository; checked out $(git rev-parse HEAD) as $branch instead"
+            exit 1
+          fi
+          echo "Building $branch at $(git rev-parse HEAD)"
+      # pnpm v11 ships no darwin-x64 standalone binary, and the pnpm/action-setup v6 self-update
+      # path needs one; this darwin-x64 job stays on the v5 npm-install line.
+      - uses: pnpm/action-setup@v5.0.0
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '^24.22.3'
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check packaging configuration and toolchain
+        if: ${{ inputs.check_only }}
+        run: pnpm run package:desktop:mac:x64:unsigned --check
+      - name: Build unsigned Intel DMG
+        if: ${{ !inputs.check_only }}
+        run: pnpm run package:desktop:mac:x64:unsigned
+      - name: Collect and verify the DMG
+        if: ${{ !inputs.check_only }}
+        id: artifacts
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          directory='apps/desktop/.desktop-build/targets/mac-x64/unsigned-artifacts'
+          dmgs=("$directory"/*.dmg)
+          if [ "${#dmgs[@]}" -ne 1 ]; then
+            echo "::error::expected exactly one DMG in $directory, found ${#dmgs[@]}"
+            ls -la "$directory" 2>/dev/null || echo '(directory absent)'
+            exit 1
+          fi
+          dmg="${dmgs[0]}"
+          name="$(basename "$dmg")"
+          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          ls -lh "$dmg"
+          shasum -a 256 "$dmg" | tee dmg.sha256
+          hdiutil imageinfo "$dmg" | grep -E 'Format|Checksum Type' || true
+
+          mount="$(mktemp -d "$RUNNER_TEMP/dmg.XXXXXX")"
+          hdiutil attach -nobrowse -readonly -noautoopen -mountpoint "$mount" "$dmg" >/dev/null
+          trap 'hdiutil detach "$mount" -quiet || true; rm -rf "$mount"' EXIT
+
+          app="$(find "$mount" -maxdepth 1 -name '*.app' -print -quit)"
+          if [ -z "$app" ]; then
+            echo "::error::DMG contains no .app bundle"
+            exit 1
+          fi
+          executable="$(find "$app/Contents/MacOS" -maxdepth 1 -type f -perm -111 -print -quit)"
+          if [ -z "$executable" ]; then
+            echo "::error::application bundle has no executable under Contents/MacOS"
+            exit 1
+          fi
+          archs="$(lipo -archs "$executable")"
+          echo "main executable archs: $archs"
+          echo "CFBundleShortVersionString: $(defaults read "$app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || echo unknown)"
+          echo "CFBundleIdentifier: $(defaults read "$app/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || echo unknown)"
+          if [ "$archs" != 'x86_64' ]; then
+            echo "::error::expected a thin x86_64 application, got: $archs"
+            exit 1
+          fi
+      - name: Summarize the build
+        if: ${{ !inputs.check_only }}
+        run: |
+          set -euo pipefail
+          {
+            echo '### macOS Intel (x64) unsigned DMG'
+            echo
+            echo '| Field | Value |'
+            echo '| --- | --- |'
+            echo "| Source | \`${{ inputs.source_ref }}\` @ \`$(git rev-parse --short HEAD)\` |"
+            echo "| Product version | \`${{ steps.artifacts.outputs.version }}\` |"
+            echo "| Installer | \`${{ steps.artifacts.outputs.name }}\` |"
+            echo "| Size | $(du -h "${{ steps.artifacts.outputs.dmg }}" | cut -f1) |"
+            echo "| SHA-256 | \`$(cut -d' ' -f1 dmg.sha256)\` |"
+            echo
+            echo 'Unsigned and unnotarized: the first launch needs System Settings → Privacy & Security approval. Automatic updates are not configured.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the DMG as a workflow artifact
+        if: ${{ !inputs.check_only && !cancelled() && steps.artifacts.outcome == 'success' }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ steps.artifacts.outputs.name }}
+          path: |
+            ${{ steps.artifacts.outputs.dmg }}
+            dmg.sha256
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish the DMG to Releases
+        if: ${{ !inputs.check_only && inputs.publish_release && !cancelled() && steps.artifacts.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DMG: ${{ steps.artifacts.outputs.dmg }}
+          DMG_NAME: ${{ steps.artifacts.outputs.name }}
+          PRODUCT_VERSION: ${{ steps.artifacts.outputs.version }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          tag="${REQUESTED_TAG:-desktop-x64-${PRODUCT_VERSION}-r${GITHUB_RUN_NUMBER}}"
+          notes="$(cat <<EOF
+          Unofficial local macOS Intel (x64) build of DeepSeek Harness Desktop, packaged from \`${SOURCE_REF}\` at \`$(git rev-parse HEAD)\` with \`pnpm run package:desktop:mac:x64:unsigned\`.
+
+          - Architecture: x86_64 (Intel Macs)
+          - Product version: \`${PRODUCT_VERSION}\`
+          - SHA-256: \`$(cut -d' ' -f1 dmg.sha256)\`
+          - Built on \`macos-15-intel\`, workflow run [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
+
+          The DMG is unsigned and unnotarized. On first launch macOS blocks it: open **System Settings → Privacy & Security** and choose **Open Anyway**. Automatic updates are not configured, so a newer version needs a newer release from this repository.
+          EOF
+          )"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$DMG" dmg.sha256 --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" "$DMG" dmg.sha256 \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$(git rev-parse HEAD)" \
+              --title "DeepSeek Harness Desktop ${PRODUCT_VERSION} · macOS Intel (x64) unsigned" \
+              --notes "$notes" \
+              --prerelease
+          fi
+          echo "Published: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${tag}"
