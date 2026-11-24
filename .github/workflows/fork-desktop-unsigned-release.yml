@@ -91,7 +91,7 @@ jobs:
 
           const targets = {
             'mac-x64': { runner: 'macos-15-intel', script: 'package:desktop:mac:x64:unsigned', directory: 'mac-x64', arch: 'x86_64' },
-            'mac-arm64': { runner: 'macos-15', script: 'package:desktop:mac:arm64:unsigned', directory: 'mac-arm64', arch: 'arm64' },
+            'mac-arm64': { runner: 'macos-latest', script: 'package:desktop:mac:arm64:unsigned', directory: 'mac-arm64', arch: 'arm64' },
             'win-x64': { runner: 'windows-2025', script: 'package:desktop:win:x64:unsigned', directory: 'win-x64', arch: 'x86_64' },
           }
           const unknown = requested.filter(platform => targets[platform] === undefined)
