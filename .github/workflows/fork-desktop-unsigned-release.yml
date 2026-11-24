@@ -52,7 +52,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
-      matrix: ${{ steps.resolve.outputs.matrix }}
+      mac_matrix: ${{ steps.resolve.outputs.mac_matrix }}
+      windows: ${{ steps.resolve.outputs.windows }}
       repository: ${{ steps.resolve.outputs.repository }}
       ref: ${{ steps.resolve.outputs.ref }}
       version: ${{ steps.resolve.outputs.version }}
@@ -89,9 +90,9 @@ jobs:
             .split(',').map(value => value.trim()).filter(Boolean)
 
           const targets = {
-            'mac-x64': { runner: 'macos-15-intel', script: 'package:desktop:mac:x64:unsigned', directory: 'mac-x64', extension: 'dmg', arch: 'x86_64', shell: 'bash' },
-            'mac-arm64': { runner: 'macos-15', script: 'package:desktop:mac:arm64:unsigned', directory: 'mac-arm64', extension: 'dmg', arch: 'arm64', shell: 'bash' },
-            'win-x64': { runner: 'windows-2025', script: 'package:desktop:win:x64:unsigned', directory: 'win-x64', extension: 'exe', arch: 'x86_64', shell: 'pwsh' },
+            'mac-x64': { runner: 'macos-15-intel', script: 'package:desktop:mac:x64:unsigned', directory: 'mac-x64', arch: 'x86_64' },
+            'mac-arm64': { runner: 'macos-15', script: 'package:desktop:mac:arm64:unsigned', directory: 'mac-arm64', arch: 'arm64' },
+            'win-x64': { runner: 'windows-2025', script: 'package:desktop:win:x64:unsigned', directory: 'win-x64', arch: 'x86_64' },
           }
           const unknown = requested.filter(platform => targets[platform] === undefined)
           if (unknown.length > 0) {
@@ -112,11 +113,10 @@ jobs:
             // No release for this version yet: every requested platform builds.
           }
 
+          const checkOnly = environment.CHECK_ONLY === 'true'
           const missing = requested.filter(platform => !published.some(name => name.includes(`-${platform}-unsigned.`)))
-          const selected = environment.EVENT_NAME === 'schedule' && environment.CHECK_ONLY !== 'true' ? missing : requested
-          const matrix = selected.length === 0
-            ? ''
-            : JSON.stringify({ include: selected.map(platform => ({ platform, ...targets[platform] })) })
+          const selected = environment.EVENT_NAME === 'schedule' && !checkOnly ? missing : requested
+          const macPlatforms = selected.filter(platform => platform !== 'win-x64')
 
           const output = {
             repository,
@@ -124,9 +124,12 @@ jobs:
             version,
             commit,
             release_tag: releaseTag,
-            check_only: environment.CHECK_ONLY === 'true' ? 'true' : 'false',
+            check_only: String(checkOnly),
             publish_release: environment.PUBLISH_RELEASE === 'false' ? 'false' : 'true',
-            matrix,
+            mac_matrix: macPlatforms.length === 0
+              ? ''
+              : JSON.stringify({ include: macPlatforms.map(platform => ({ platform, ...targets[platform] })) }),
+            windows: String(selected.includes('win-x64')),
             building: selected.join(' '),
           }
           appendFileSync(environment.GITHUB_OUTPUT,
@@ -140,29 +143,30 @@ jobs:
           {
             echo '### Unsigned desktop installers'
             echo
-            echo "| Field | Value |"
-            echo "| --- | --- |"
+            echo '| Field | Value |'
+            echo '| --- | --- |'
             echo "| Source | \`${{ steps.resolve.outputs.repository }}\` @ \`${{ steps.resolve.outputs.commit }}\` |"
             echo "| Version | \`${{ steps.resolve.outputs.version }}\` |"
             echo "| Release tag | \`${{ steps.resolve.outputs.release_tag }}\` |"
             echo "| Building | \`${{ steps.resolve.outputs.building }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  package:
+  package_macos:
     name: Package ${{ matrix.platform }}
     needs: plan
-    if: needs.plan.outputs.matrix != ''
+    if: needs.plan.outputs.mac_matrix != ''
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.plan.outputs.mac_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 300
+    defaults:
+      run:
+        shell: bash
     env:
       DSH_TELEMETRY_DISABLED: '1'
     steps:
       - name: Report build host
-        if: matrix.shell == 'bash'
-        shell: bash
         run: |
           set -euo pipefail
           uname -a
@@ -171,14 +175,6 @@ jobs:
           echo "ncpu=$(sysctl -n hw.ncpu) mem_gb=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))"
           xcodebuild -version
           df -h /
-      - name: Report build host
-        if: matrix.shell == 'pwsh'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          "pwsh $($PSVersionTable.PSVersion)"
-          (Get-CimInstance Win32_Processor).Name
-          Get-PSDrive C | Format-List Used,Free
       - uses: actions/checkout@v7.0.1
         with:
           repository: ${{ needs.plan.outputs.repository }}
@@ -195,43 +191,23 @@ jobs:
           node-version: '^24.22.3'
           cache: pnpm
       - name: Install locked dependencies
-        shell: ${{ matrix.shell }}
         run: pnpm install --frozen-lockfile
-      # Windows packaging resolves mandatory-update policy metadata even for unsigned builds, so the
-      # selected deployment needs an HTTPS origin. The reserved `.invalid` domain never resolves, so
-      # the packaged application reports the policy as unavailable instead of contacting a real
-      # service; automatic updates stay unconfigured, as for every unsigned build.
-      - name: Write the Windows packaging settings
-        if: matrix.platform == 'win-x64'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $settings = @(
-            'DSH_DESKTOP_APP_ID=com.deepseek.harness'
-            'DSH_DESKTOP_AUTO_UPDATE_ENV=production'
-            'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://policy.invalid'
-          )
-          Set-Content -Path 'apps/desktop/.env.windows' -Value $settings -Encoding utf8NoBOM
-          Get-Content 'apps/desktop/.env.windows'
       - name: Check packaging configuration and toolchain
         if: needs.plan.outputs.check_only == 'true'
-        shell: ${{ matrix.shell }}
         run: pnpm run ${{ matrix.script }} --check
       - name: Build the unsigned installer
         if: needs.plan.outputs.check_only != 'true'
-        shell: ${{ matrix.shell }}
         run: pnpm run ${{ matrix.script }}
-      - name: Verify the macOS installer
-        if: matrix.shell == 'bash' && needs.plan.outputs.check_only != 'true'
-        id: mac
-        shell: bash
+      - name: Verify the installer
+        if: needs.plan.outputs.check_only != 'true'
+        id: artifacts
         run: |
           set -euo pipefail
           shopt -s nullglob
           directory="apps/desktop/.desktop-build/targets/${{ matrix.directory }}/unsigned-artifacts"
-          installers=("$directory"/*.${{ matrix.extension }})
+          installers=("$directory"/*.dmg)
           if [ "${#installers[@]}" -ne 1 ]; then
-            echo "::error::expected exactly one installer in $directory, found ${#installers[@]}"
+            echo "::error::expected exactly one DMG in $directory, found ${#installers[@]}"
             ls -la "$directory" 2>/dev/null || echo '(directory absent)'
             exit 1
           fi
@@ -257,66 +233,130 @@ jobs:
             echo "::error::expected a thin ${{ matrix.arch }} application, got: $archs"
             exit 1
           fi
-      - name: Verify the Windows installer
-        if: matrix.shell == 'pwsh' && needs.plan.outputs.check_only != 'true'
-        id: windows
+      - name: Summarize the installer
+        if: needs.plan.outputs.check_only != 'true'
+        run: |
+          {
+            echo "### \`${{ matrix.platform }}\`"
+            echo
+            echo '| Field | Value |'
+            echo '| --- | --- |'
+            echo "| Installer | \`${{ steps.artifacts.outputs.name }}\` |"
+            echo "| Size | $(du -h "${{ steps.artifacts.outputs.file }}" | cut -f1) |"
+            echo "| Source commit | \`${{ needs.plan.outputs.commit }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7.0.1
+        if: needs.plan.outputs.check_only != 'true'
+        with:
+          name: ${{ steps.artifacts.outputs.name }}
+          path: ${{ steps.artifacts.outputs.file }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+
+  package_windows:
+    name: Package win-x64
+    needs: plan
+    if: needs.plan.outputs.windows == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 300
+    defaults:
+      run:
         shell: pwsh
+    env:
+      DSH_TELEMETRY_DISABLED: '1'
+    steps:
+      - name: Report build host
         run: |
           $ErrorActionPreference = 'Stop'
-          $directory = "apps/desktop/.desktop-build/targets/${{ matrix.directory }}/unsigned-artifacts"
-          $installers = @(Get-ChildItem -Path $directory -Filter "*.${{ matrix.extension }}")
+          "pwsh $($PSVersionTable.PSVersion)"
+          (Get-CimInstance Win32_Processor).Name
+          Get-PSDrive C | Format-List Used,Free
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: ${{ needs.plan.outputs.repository }}
+          ref: ${{ needs.plan.outputs.ref }}
+          persist-credentials: false
+          clean: true
+      - uses: pnpm/action-setup@v5.0.0
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: '^24.22.3'
+          cache: pnpm
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      # Windows packaging resolves mandatory-update policy metadata even for unsigned builds, so the
+      # selected deployment needs an HTTPS origin. The reserved `.invalid` domain never resolves, so
+      # the packaged application reports the policy as unavailable instead of contacting a service it
+      # does not belong to; automatic updates stay unconfigured, as for every unsigned build.
+      - name: Write the Windows packaging settings
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $settings = @(
+            'DSH_DESKTOP_APP_ID=com.deepseek.harness'
+            'DSH_DESKTOP_AUTO_UPDATE_ENV=production'
+            'DSH_DESKTOP_MANDATORY_UPDATE_PROD_ORIGIN=https://policy.invalid'
+          )
+          Set-Content -Path 'apps/desktop/.env.windows' -Value $settings -Encoding utf8NoBOM
+          Get-Content 'apps/desktop/.env.windows'
+      - name: Check packaging configuration and toolchain
+        if: needs.plan.outputs.check_only == 'true'
+        run: pnpm run package:desktop:win:x64:unsigned --check
+      - name: Build the unsigned installer
+        if: needs.plan.outputs.check_only != 'true'
+        run: pnpm run package:desktop:win:x64:unsigned
+      - name: Verify the installer
+        if: needs.plan.outputs.check_only != 'true'
+        id: artifacts
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $directory = 'apps/desktop/.desktop-build/targets/win-x64/unsigned-artifacts'
+          $installers = @(Get-ChildItem -Path $directory -Filter '*.exe')
           if ($installers.Count -ne 1) {
-            throw "expected exactly one installer in $directory, found $($installers.Count)"
+            throw "expected exactly one EXE in $directory, found $($installers.Count)"
           }
           $installer = $installers[0]
           "file=$($installer.FullName)" >> $env:GITHUB_OUTPUT
           "name=$($installer.Name)" >> $env:GITHUB_OUTPUT
           $signature = Get-AuthenticodeSignature -FilePath $installer.FullName
-          $version = (Get-Item $installer.FullName).VersionInfo
-          "installer: $($installer.Name) bytes=$($installer.Length) signature=$($signature.Status) product=$($version.ProductVersion)"
+          $info = (Get-Item $installer.FullName).VersionInfo
+          "installer: $($installer.Name) bytes=$($installer.Length) signature=$($signature.Status) product=$($info.ProductVersion)"
           if ($signature.Status -ne 'NotSigned') {
             throw "expected an unsigned installer, got $($signature.Status)"
           }
-      - name: Summarize the macOS installer
-        if: matrix.shell == 'bash' && needs.plan.outputs.check_only != 'true'
-        run: |
-          {
-            echo "### \`${{ matrix.platform }}\`"
-            echo
-            echo "| Field | Value |"
-            echo "| --- | --- |"
-            echo "| Installer | \`${{ steps.mac.outputs.name }}\` |"
-            echo "| Size | $(du -h "${{ steps.mac.outputs.file }}" | cut -f1) |"
-            echo "| Source commit | \`${{ needs.plan.outputs.commit }}\` |"
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Summarize the Windows installer
-        if: matrix.shell == 'pwsh' && needs.plan.outputs.check_only != 'true'
-        shell: pwsh
+      - name: Summarize the installer
+        if: needs.plan.outputs.check_only != 'true'
         run: |
           $ErrorActionPreference = 'Stop'
-          $size = '{0:N1} MiB' -f ((Get-Item '${{ steps.windows.outputs.file }}').Length / 1MB)
+          $size = '{0:N1} MiB' -f ((Get-Item '${{ steps.artifacts.outputs.file }}').Length / 1MB)
           @(
-            "### ``${{ matrix.platform }}``"
+            '### `win-x64`'
             ''
             '| Field | Value |'
             '| --- | --- |'
-            "| Installer | ``${{ steps.windows.outputs.name }}`` |"
+            "| Installer | ``${{ steps.artifacts.outputs.name }}`` |"
             "| Size | $size |"
             "| Source commit | ``${{ needs.plan.outputs.commit }}`` |"
-          ) + @('') | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+            ''
+          ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
       - uses: actions/upload-artifact@v7.0.1
         if: needs.plan.outputs.check_only != 'true'
         with:
-          name: ${{ steps.mac.outputs.name }}${{ steps.windows.outputs.name }}
-          path: ${{ steps.mac.outputs.file }}${{ steps.windows.outputs.file }}
+          name: ${{ steps.artifacts.outputs.name }}
+          path: ${{ steps.artifacts.outputs.file }}
           archive: false
           if-no-files-found: error
           retention-days: 14
 
   release:
     name: Publish release
-    needs: [plan, package]
-    if: needs.package.result == 'success' && needs.plan.outputs.publish_release == 'true'
+    needs: [plan, package_macos, package_windows]
+    if: >-
+      !cancelled() && needs.plan.outputs.publish_release == 'true'
+      && needs.plan.outputs.check_only != 'true'
+      && (needs.package_macos.result == 'success' || needs.package_windows.result == 'success')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -341,32 +381,29 @@ jobs:
           SOURCE_REF: ${{ needs.plan.outputs.ref }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
           notes="$(cat <<EOF
-          Unofficial local unsigned installers for $SOURCE_REPOSITORY at \`$COMMIT\`, packaged from \`$SOURCE_REF\` with the documented \`package:desktop:*:unsigned\` commands.
+          Unofficial unsigned installers for $SOURCE_REPOSITORY at \`$COMMIT\`, packaged from \`$SOURCE_REF\` with the documented \`package:desktop:*:unsigned\` commands.
 
           - Product version: \`$VERSION\`
           - Checksums: \`SHA256SUMS.txt\`
           - Workflow run: [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
 
-          | Platform | Installer |
-          | --- | --- |
           $(cd dist && for file in *; do
             case "$file" in
-              *-mac-x64-*) echo "| macOS Intel (x86_64) | \`$file\` |" ;;
-              *-mac-arm64-*) echo "| macOS Apple Silicon (arm64) | \`$file\` |" ;;
-              *-win-x64-*) echo "| Windows x64 | \`$file\` |" ;;
+              *-mac-x64-*) echo "- macOS Intel (x86_64): \`$file\`" ;;
+              *-mac-arm64-*) echo "- macOS Apple Silicon (arm64): \`$file\`" ;;
+              *-win-x64-*) echo "- Windows x64: \`$file\`" ;;
             esac
           done)
 
-          The installers are unsigned and unnotarized. On macOS, open **System Settings → Privacy & Security** and choose **Open Anyway** for the first launch. On Windows, SmartScreen warns before running the installer. Automatic updates are not configured, and Windows mandatory-update policy reports itself unavailable, so a newer version needs a newer release from this repository.
+          The installers are unsigned and unnotarized. On macOS, open System Settings → Privacy & Security and choose Open Anyway for the first launch. On Windows, SmartScreen warns before running the installer. Automatic updates are not configured, and Windows mandatory-update policy reports itself unavailable, so a newer version needs a newer release from this repository.
           EOF
           )"
           case "$VERSION" in *-*) prerelease=(--prerelease) ;; *) prerelease=() ;; esac
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            shopt -s nullglob
             gh release upload "$RELEASE_TAG" dist/* SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
           else
-            shopt -s nullglob
             gh release create "$RELEASE_TAG" dist/* SHA256SUMS.txt \
               --repo "$GITHUB_REPOSITORY" \
               --title "Desktop $VERSION · unsigned installers" \
