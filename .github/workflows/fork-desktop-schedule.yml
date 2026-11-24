@@ -1,0 +1,64 @@
+name: Fork · Desktop · unsigned schedule
+
+# Fork-only companion to `fork-desktop-unsigned-release.yml`.
+#
+# The builder has repeatedly come back `disabled_manually` after a run that published a release,
+# and a disabled workflow ignores its own `schedule` trigger, so the daily cron lives here instead:
+# this workflow performs no release writes, re-enables the builder when needed, and dispatches it
+# with `scheduled=true` so it builds only the platforms still missing from the current release.
+#
+# See `.github/workflows/fork-desktop-unsigned-release.yml` for the build itself.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 22:00 UTC = 06:00 Asia/Shanghai.
+    - cron: '0 22 * * *'
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: fork-desktop-unsigned-schedule
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Dispatch the builder
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Re-enable and dispatch the builder workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          builder=".github/workflows/fork-desktop-unsigned-release.yml"
+          id="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq --arg path "$builder" '.workflows[] | select(.path == $path) | .id')"
+          if [ -z "$id" ]; then
+            echo "::error::$builder is not registered on this repository"
+            exit 1
+          fi
+          state="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$id" --jq .state)"
+          echo "builder $id is $state"
+          if [ "$state" != 'active' ]; then
+            gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/$id/enable"
+            echo "re-enabled builder $id, now $(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$id" --jq .state)"
+          fi
+          version="$(gh api "repos/deepseek-ai/deepseek-harness/contents/package.json?ref=master" --jq .content \
+            | base64 -d | jq -r .version)"
+          echo "upstream version is $version; dispatching the builder"
+          gh workflow run "$id" --repo "$GITHUB_REPOSITORY" --ref my-main \
+            -f source_repository=deepseek-ai/deepseek-harness \
+            -f source_ref=master \
+            -f platforms=mac-x64,mac-arm64,win-x64 \
+            -f scheduled=true \
+            -f check_only=false \
+            -f publish_release=true
+          sleep 10
+          gh run list --repo "$GITHUB_REPOSITORY" --workflow "$id" --limit 1 \
+            --json databaseId,status,createdAt,displayTitle \
+            --jq '.[0] | "dispatched run \(.databaseId) (\(.status)) at \(.createdAt)"'

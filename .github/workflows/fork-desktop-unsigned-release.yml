@@ -9,9 +9,10 @@ name: Fork · Desktop · unsigned installers
 # The schedule builds only the platforms whose installer for the current upstream version is not
 # published yet, so an upstream version bump produces a new release without operator input.
 #
-# This workflow has twice been observed to fall back to `disabled_manually` in this fork with no
-# attributed cause, which stops the schedule silently. Check `gh workflow list` after changing the
-# repository and re-enable with `gh workflow enable <id>` before relying on the schedule.
+# Runs that publish a release have repeatedly left this workflow `disabled_manually`; runs that only
+# check or build did not. The cause is not identified, and a disabled workflow ignores its own
+# schedule, so the daily trigger lives in `fork-desktop-schedule.yml`, which re-enables this workflow
+# and dispatches it.
 
 on:
   workflow_dispatch:
@@ -31,6 +32,10 @@ on:
         type: string
         default: mac-x64,mac-arm64,win-x64
         required: true
+      scheduled:
+        description: '由看护工作流派发的运行：只构建尚未发布的平台'
+        type: boolean
+        default: false
       check_only:
         description: '仅预检工具链与打包配置，不构建'
         type: boolean
@@ -39,9 +44,6 @@ on:
         description: '成功后发布到本仓库 Releases'
         type: boolean
         default: true
-  schedule:
-    # 22:00 UTC = 06:00 Asia/Shanghai. The plan job skips already published platforms.
-    - cron: '0 22 * * *'
 
 permissions:
   contents: write
@@ -81,6 +83,7 @@ jobs:
           PLATFORMS: ${{ inputs.platforms || 'mac-x64,mac-arm64,win-x64' }}
           CHECK_ONLY: ${{ inputs.check_only }}
           PUBLISH_RELEASE: ${{ inputs.publish_release }}
+          SCHEDULED: ${{ inputs.scheduled }}
         run: |
           set -euo pipefail
           node --input-type=module <<'JS'
@@ -119,7 +122,8 @@ jobs:
 
           const checkOnly = environment.CHECK_ONLY === 'true'
           const missing = requested.filter(platform => !published.some(name => name.includes(`-${platform}-unsigned.`)))
-          const selected = environment.EVENT_NAME === 'schedule' && !checkOnly ? missing : requested
+          const onlyMissing = environment.SCHEDULED === 'true' || environment.EVENT_NAME === 'schedule'
+          const selected = onlyMissing && !checkOnly ? missing : requested
           const macPlatforms = selected.filter(platform => platform !== 'win-x64')
 
           const output = {
