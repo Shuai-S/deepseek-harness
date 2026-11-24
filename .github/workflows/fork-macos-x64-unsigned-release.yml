@@ -154,9 +154,16 @@ jobs:
         uses: actions/upload-artifact@v7.0.1
         with:
           name: ${{ steps.artifacts.outputs.name }}
-          path: |
-            ${{ steps.artifacts.outputs.dmg }}
-            dmg.sha256
+          path: ${{ steps.artifacts.outputs.dmg }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload the DMG checksum as a workflow artifact
+        if: ${{ !inputs.check_only && !cancelled() && steps.artifacts.outcome == 'success' }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: ${{ steps.artifacts.outputs.name }}.sha256
+          path: dmg.sha256
           archive: false
           if-no-files-found: error
           retention-days: 14
